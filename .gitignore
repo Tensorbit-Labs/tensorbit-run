@@ -1,0 +1,35 @@
+# Build artifacts
+build/
+cmake-build-*/
+out/
+
+# IDE
+.vs/
+.vscode/
+.idea/
+*.swp
+*.swo
+*~
+
+# Model files
+*.tb
+*.tbm
+*.safetensors
+*.bin
+*.gguf
+*.pt
+*.pth
+
+# Logs and temp
+*.log
+/tmp/
+
+# OS
+.DS_Store
+Thumbs.db
+
+# AGENTS.md is project-internal
+AGENTS.md
+
+# Test outputs
+/tests/*.actual
