@@ -20,8 +20,10 @@ int tb_cpu_scaled_dot_product_dispatch(void* output, const void** inputs, int n_
     const TbTensor* mask = (n_inputs >= 4 && inputs[3]) ? (const TbTensor*)inputs[3] : NULL;
 
     int n_heads = (int)q->shape[0];
-    int seq_len = (int)q->shape[1];
+    /* q_seq_len may differ from kv_seq_len in decode (padded Q handles this) */
+    int kv_seq_len = (int)k->shape[1];
     int head_dim = (int)q->shape[2];
+    int seq_len = kv_seq_len;  /* use K's sequence length for KV dimension */
 
     bool  causal = sp ? sp->causal : true;
     float scale = sp ? sp->scale : (1.0f / sqrtf((float)head_dim));

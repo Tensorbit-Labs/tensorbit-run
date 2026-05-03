@@ -39,3 +39,43 @@ int tb_cpu_rope_f32(int n_heads, int seq_len, int head_dim, float* TB_RESTRICT q
 
     return TB_OK;
 }
+
+int tb_cpu_rope_gqa_f32(int n_q_heads, int n_kv_heads, int head_dim,
+                         float* TB_RESTRICT q, float* TB_RESTRICT k,
+                         int position, float theta_base) {
+    if (!q || !k) return TB_ERR_INVALID_ARG;
+
+    /* Rotate Q (n_q_heads) */
+    for (int h = 0; h < n_q_heads; h++) {
+        float* qh = q + h * head_dim;
+        for (int i = 0; i < head_dim / 2; i++) {
+            float theta = 1.0f / powf(theta_base, (2.0f * i) / (float)head_dim);
+            float cos_val = cosf((float)position * theta);
+            float sin_val = sinf((float)position * theta);
+            int idx0 = 2 * i;
+            int idx1 = 2 * i + 1;
+            float q0 = qh[idx0];
+            float q1 = qh[idx1];
+            qh[idx0] = q0 * cos_val - q1 * sin_val;
+            qh[idx1] = q1 * cos_val + q0 * sin_val;
+        }
+    }
+
+    /* Rotate K (n_kv_heads only — fewer heads for GQA) */
+    for (int h = 0; h < n_kv_heads; h++) {
+        float* kh = k + h * head_dim;
+        for (int i = 0; i < head_dim / 2; i++) {
+            float theta = 1.0f / powf(theta_base, (2.0f * i) / (float)head_dim);
+            float cos_val = cosf((float)position * theta);
+            float sin_val = sinf((float)position * theta);
+            int idx0 = 2 * i;
+            int idx1 = 2 * i + 1;
+            float k0 = kh[idx0];
+            float k1 = kh[idx1];
+            kh[idx0] = k0 * cos_val - k1 * sin_val;
+            kh[idx1] = k1 * cos_val + k0 * sin_val;
+        }
+    }
+
+    return TB_OK;
+}

@@ -1,72 +1,46 @@
-#ifndef TENSORBIT_RUN_OPS_HPP
-#define TENSORBIT_RUN_OPS_HPP
+#pragma once
 
-#include <cmath>
-#include <cstring>
+/// @file ops.hpp
+/// @brief TransformerRunner — flexible Llama/GPT-J/Phi-style forward pass.
+/// @ingroup tensorbit-run
+///
+/// Auto-detects model naming conventions (Llama, GPT-J, Phi) by probing
+/// tensor names.  Handles sparse N:M and dense linear paths with GQA support.
 
+#include "tensorbit/run/backend.hpp"
 #include "tensorbit/run/common.hpp"
 #include "tensorbit/run/model.hpp"
 #include "tensorbit/run/tensor.hpp"
-#include "tensorbit/run/backend.hpp"
+
+#include <cmath>
+#include <cstring>
+#include <string>
+#include <vector>
 
 namespace tensorbit {
 namespace run {
 
-/* ================================================================
- * Forward pass state — activations and KV cache for one sequence
- * ================================================================ */
-
 struct RunState {
-    Tensor x;               /* current hidden state [hidden_size] */
-    Tensor residual;        /* residual for attention [hidden_size] */
-
-    /* KV cache: [num_layers, 2, max_seq_len, num_kv_heads * head_dim] */
+    Tensor x;
+    Tensor residual;
+    int    seq_pos = 0;
     std::vector<Tensor> k_cache;
     std::vector<Tensor> v_cache;
-
-    int seq_pos = 0;        /* current sequence position */
 };
-
-/* ================================================================
- * Transformer forward pass (Llama-style decoder)
- *
- * Architecture:
- *   x = embedding(token_ids)
- *   for each layer:
- *     residual = x
- *     x = rms_norm(x, input_layernorm)
- *     q,k,v = sparse_linear_qkv(x, Wq,Wk,Wv)
- *     q,k = rope(q, k, position)
- *     k_cache[seq_pos] = k, v_cache[seq_pos] = v
- *     x = scaled_dot_product(q, k_cache, v_cache, causal)
- *     x = sparse_linear(x, Wo)
- *     x = residual_add(x, residual)
- *     residual = x
- *     x = rms_norm(x, post_attention_layernorm)
- *     gate = silu(sparse_linear(x, W_gate))
- *     up = sparse_linear(x, W_up)
- *     x = gate * up
- *     x = sparse_linear(x, W_down)
- *     x = residual_add(x, residual)
- *   x = rms_norm(x, final_norm)
- *   logits = dense_linear(x, lm_head)
- * ================================================================ */
 
 class TransformerRunner {
 public:
-    TransformerRunner(const Model& model) : model_(model) { init_state(); }
+    explicit TransformerRunner(const Model& model) : model_(model), state_() {}
 
-    /* Initialize run state allocations */
     void init_state() {
         auto cfg = model_.config();
-        int  hidden = cfg.hidden_size;
-        int  n_layers = cfg.num_layers;
+        int  hidden = cfg.hidden_size > 0 ? cfg.hidden_size : 512;
+        int  n_layers = cfg.num_layers > 0 ? cfg.num_layers : 1;
 
         state_.x = Tensor({(size_t)hidden}, Dtype::kF32);
         state_.residual = Tensor({(size_t)hidden}, Dtype::kF32);
         state_.seq_pos = 0;
 
-        /* KV cache: pre-allocate for max_seq_len (up to 2048) */
         state_.k_cache.resize(n_layers);
         state_.v_cache.resize(n_layers);
         for (int i = 0; i < n_layers; i++) {
@@ -76,245 +50,258 @@ public:
         }
     }
 
-    /* Run one token through the model.
-     * token_id: input token
-     * Returns: logits tensor [vocab_size] */
+    void reset() {
+        state_.seq_pos = 0;
+    }
+
+    int vocab_size() const { return model_.config().vocab_size; }
+    const float* logits() const { return state_.x.f32(); }
+
+    /// Flexible layer name search: tries multiple naming conventions.
+    static std::string find_weight_name(const Model& m, int layer, const char* component) {
+        // Llama/Mistral: model.layers.{layer}.{component}.weight
+        std::string llama = "model.layers." + std::to_string(layer) + "." + component + ".weight";
+        if (m.find_layer(llama) >= 0) return llama;
+
+        // GPT-J: transformer.h.{layer}.{component}.weight
+        std::string gptj = "transformer.h." + std::to_string(layer) + "." + component + ".weight";
+        if (m.find_layer(gptj) >= 0) return gptj;
+
+        // Phi: transformer.h.{layer}.{component}.weight (same as GPT-J)
+        // Phi also uses model.layers.{layer}.{component}.weight for some releases
+        // Try bare component (no layer prefix — some optimised configs):
+        std::string bare = component + std::string(".weight");
+        if (m.find_layer(bare) >= 0) return bare;
+
+        return "";  // not found
+    }
+
+    /// Find a named weight layer in the model, 0..num_layers-1, or -1.
+    static int find_weight_idx(const Model& m, const std::string& name) {
+        if (name.empty()) return -1;
+        return m.find_layer(name);
+    }
+
+    /// Single token forward pass.
     const float* forward(int token_id) {
         auto cfg = model_.config();
-        int  hidden = cfg.hidden_size;
-        int  n_layers = cfg.num_layers;
-        int  n_heads = cfg.num_heads;
-        int  n_kv_heads = cfg.num_kv_heads;
-        int  head_dim = cfg.head_dim;
+        int  hidden = cfg.hidden_size > 0 ? cfg.hidden_size : 512;
+        int  n_layers = cfg.num_layers > 0 ? cfg.num_layers : 1;
+        int  n_heads = cfg.num_heads > 0 ? cfg.num_heads : 8;
+        int  n_kv_heads = cfg.num_kv_heads > 0 ? cfg.num_kv_heads : n_heads;
+        int  head_dim = cfg.head_dim > 0 ? cfg.head_dim : (hidden / n_heads);
 
-        /* Embedding */
-        int emb_idx = model_.find_layer("model.embed_tokens.weight");
-        if (emb_idx < 0) {
-            TB_LOG_ERROR("embedding layer not found");
-            return nullptr;
+        if (head_dim <= 0 || hidden <= 0) return nullptr;
+
+        // Embedding
+        int emb_idx = -1;
+        for (auto& name : {"model.embed_tokens.weight", "transformer.wte.weight", "transformer.embd.wte.weight"}) {
+            emb_idx = model_.find_layer(name);
+            if (emb_idx >= 0) break;
         }
+        if (emb_idx < 0) return nullptr;
         Tensor emb = model_.get_weights(emb_idx);
         if (!emb.data()) return nullptr;
-
         embedding(state_.x, &token_id, 1, emb);
 
-        /* Layer loop */
+        // Layer loop
         for (int l = 0; l < n_layers; l++) {
-            auto q_proj = fmt_layer_name(l, "self_attn.q_proj");
-            auto k_proj = fmt_layer_name(l, "self_attn.k_proj");
-            auto v_proj = fmt_layer_name(l, "self_attn.v_proj");
-            auto o_proj = fmt_layer_name(l, "self_attn.o_proj");
-            auto gate_proj = fmt_layer_name(l, "mlp.gate_proj");
-            auto up_proj = fmt_layer_name(l, "mlp.up_proj");
-            auto down_proj = fmt_layer_name(l, "mlp.down_proj");
-            auto input_ln = fmt_layer_name(l, "input_layernorm");
-            auto post_ln = fmt_layer_name(l, "post_attention_layernorm");
+            auto Qw = find_weight_name(model_, l, "self_attn.q_proj");
+            auto Kw = find_weight_name(model_, l, "self_attn.k_proj");
+            auto Vw = find_weight_name(model_, l, "self_attn.v_proj");
+            auto Ow = find_weight_name(model_, l, "self_attn.o_proj");
+            auto Gw = find_weight_name(model_, l, "mlp.gate_proj");
+            auto Uw = find_weight_name(model_, l, "mlp.up_proj");
+            auto Dw = find_weight_name(model_, l, "mlp.down_proj");
+            auto In = find_weight_name(model_, l, "input_layernorm");
+            auto Pn = find_weight_name(model_, l, "post_attention_layernorm");
 
-            int wq_i = model_.find_layer(q_proj + ".weight");
-            int wk_i = model_.find_layer(k_proj + ".weight");
-            int wv_i = model_.find_layer(v_proj + ".weight");
-            int wo_i = model_.find_layer(o_proj + ".weight");
-            int wg_i = model_.find_layer(gate_proj + ".weight");
-            int wu_i = model_.find_layer(up_proj + ".weight");
-            int wd_i = model_.find_layer(down_proj + ".weight");
-            int in_i = model_.find_layer(input_ln + ".weight");
-            int pn_i = model_.find_layer(post_ln + ".weight");
+            int wq_i = find_weight_idx(model_, Qw);
+            int wk_i = find_weight_idx(model_, Kw);
+            int wv_i = find_weight_idx(model_, Vw);
+            if (wq_i < 0 || wk_i < 0 || wv_i < 0) continue;  // no attention — skip
 
-            /* -- RMSNorm before attention -- */
-            Tensor rms_weight_in = in_i >= 0 ? model_.get_weights(in_i) : Tensor();
-            rms_norm(state_.x, state_.x, rms_weight_in, cfg.norm_eps);
+            int wo_i = find_weight_idx(model_, Ow);
+            int wg_i = find_weight_idx(model_, Gw);
+            int wu_i = find_weight_idx(model_, Uw);
+            int wd_i = find_weight_idx(model_, Dw);
+            int in_i = find_weight_idx(model_, In);
+            int pn_i = find_weight_idx(model_, Pn);
 
-            /* -- Copy residual -- */
-            Tensor x_before_attn = Tensor({(size_t)hidden}, Dtype::kF32);
-            std::memcpy(x_before_attn.f32(), state_.x.f32(), hidden * sizeof(float));
+            // --- RMSNorm before attention ---
+            Tensor rms_w = in_i >= 0 ? model_.get_weights(in_i) : Tensor();
+            rms_norm(state_.x, state_.x, rms_w, cfg.norm_eps);
 
-            /* -- QKV projections -- */
-            Tensor q =
-                Tensor({(size_t)n_heads, 1, (size_t)head_dim}, Dtype::kF32);
-            Tensor k =
-                Tensor({(size_t)n_kv_heads, 1, (size_t)head_dim}, Dtype::kF32);
-            Tensor v =
-                Tensor({(size_t)n_kv_heads, 1, (size_t)head_dim}, Dtype::kF32);
+            // --- QKV projections ---
+            int q_dim = n_heads * head_dim;
+            int kv_dim_total = n_kv_heads * head_dim;
 
-            if (wq_i >= 0 && wk_i >= 0 && wv_i >= 0) {
-                Tensor Wq = model_.get_weights(wq_i);
-                Tensor Wk = model_.get_weights(wk_i);
-                Tensor Wv = model_.get_weights(wv_i);
-                Tensor Mq = model_.get_mask(wq_i);
-                Tensor Mk = model_.get_mask(wk_i);
-                Tensor Mv = model_.get_mask(wv_i);
+            Tensor q = Tensor({(size_t)n_heads, (size_t)1, (size_t)head_dim}, Dtype::kF32);
+            Tensor k = Tensor({(size_t)n_kv_heads, (size_t)1, (size_t)head_dim}, Dtype::kF32);
+            Tensor v = Tensor({(size_t)n_kv_heads, (size_t)1, (size_t)head_dim}, Dtype::kF32);
 
-                Tensor q_flat = Tensor({(size_t)(n_heads * head_dim)}, Dtype::kF32);
-                Tensor k_flat = Tensor({(size_t)(n_kv_heads * head_dim)}, Dtype::kF32);
-                Tensor v_flat = Tensor({(size_t)(n_kv_heads * head_dim)}, Dtype::kF32);
+            Tensor Wq = model_.get_weights(wq_i);
+            Tensor Wk = model_.get_weights(wk_i);
+            Tensor Wv = model_.get_weights(wv_i);
+            if (!Wq.data() || !Wk.data() || !Wv.data()) continue;
 
-                if (Mq.data()) {
-                    sparse_linear(q_flat, state_.x, Wq, Mq, Tensor());
-                    sparse_linear(k_flat, state_.x, Wk, Mk, Tensor());
-                    sparse_linear(v_flat, state_.x, Wv, Mv, Tensor());
-                } else {
-                    dense_linear(q_flat, state_.x, Wq, Tensor());
-                    dense_linear(k_flat, state_.x, Wk, Tensor());
-                    dense_linear(v_flat, state_.x, Wv, Tensor());
-                }
+            Tensor Mq = model_.get_mask(wq_i);
+            Tensor q_flat = Tensor({(size_t)q_dim}, Dtype::kF32);
+            Tensor k_flat = Tensor({(size_t)kv_dim_total}, Dtype::kF32);
+            Tensor v_flat = Tensor({(size_t)kv_dim_total}, Dtype::kF32);
 
-                /* Reshape flat → [heads, 1, head_dim] */
-                for (int h = 0; h < n_heads; h++) {
-                    std::memcpy(q.f32() + h * head_dim, q_flat.f32() + h * head_dim,
-                                head_dim * sizeof(float));
-                }
-                for (int h = 0; h < n_kv_heads; h++) {
-                    std::memcpy(k.f32() + h * head_dim, k_flat.f32() + h * head_dim,
-                                head_dim * sizeof(float));
-                    std::memcpy(v.f32() + h * head_dim, v_flat.f32() + h * head_dim,
-                                head_dim * sizeof(float));
-                }
+            if (Mq.data()) {
+                sparse_linear(q_flat, state_.x, Wq, Mq, Tensor());
+                sparse_linear(k_flat, state_.x, Wk, model_.get_mask(wk_i), Tensor());
+                sparse_linear(v_flat, state_.x, Wv, model_.get_mask(wv_i), Tensor());
+            } else {
+                dense_linear(q_flat, state_.x, Wq, Tensor());
+                dense_linear(k_flat, state_.x, Wk, Tensor());
+                dense_linear(v_flat, state_.x, Wv, Tensor());
+            }
+            // Reshape to [heads, 1, head_dim]
+            for (int h = 0; h < n_heads; h++)
+                std::memcpy(q.f32() + h * head_dim, q_flat.f32() + h * head_dim, head_dim * sizeof(float));
+            for (int h = 0; h < n_kv_heads; h++) {
+                std::memcpy(k.f32() + h * head_dim, k_flat.f32() + h * head_dim, head_dim * sizeof(float));
+                std::memcpy(v.f32() + h * head_dim, v_flat.f32() + h * head_dim, head_dim * sizeof(float));
             }
 
-            /* -- RoPE -- */
+            // --- RoPE ---
             rope(q, k, state_.seq_pos, cfg.rope_theta, head_dim);
 
-            /* -- KV cache store -- */
+            // --- KV cache: write at current position ---
             int pos = state_.seq_pos;
+            size_t kv_row = kv_dim_total;
             {
-                float* kc = state_.k_cache[l].f32() + pos * n_kv_heads * head_dim;
-                float* vc = state_.v_cache[l].f32() + pos * n_kv_heads * head_dim;
-                std::memcpy(kc, k.f32(), n_kv_heads * head_dim * sizeof(float));
-                std::memcpy(vc, v.f32(), n_kv_heads * head_dim * sizeof(float));
+                float* kc = state_.k_cache[l].f32() + pos * kv_row;
+                float* vc = state_.v_cache[l].f32() + pos * kv_row;
+                std::memcpy(kc, k.f32(), kv_row * sizeof(float));
+                std::memcpy(vc, v.f32(), kv_row * sizeof(float));
             }
 
-            /* -- Scaled dot-product attention (with KV cache) -- */
-            Tensor attn_out = Tensor({(size_t)(n_heads * head_dim)}, Dtype::kF32);
+            // --- Attention ---
+            Tensor attn_out = Tensor({(size_t)q_dim}, Dtype::kF32);
 
-            if (state_.seq_pos == 0) {
-                /* Prefill: just compute from current q, k, v */
-                /* For simplicity, use the Q from all heads */
-                float scale = 1.0f / sqrtf((float)head_dim);
+            if (pos == 0) {
+                float scale = 1.f / sqrtf((float)head_dim);
                 scaled_dot_product(attn_out, q, k, v, nullptr, scale, false);
             } else {
-                /* Decode: q has shape [n_heads, 1, head_dim], k_cache has [cur_seq, kv_dim] */
-                /* For now, use a simple single-token attention */
-                float scale = 1.0f / sqrtf((float)head_dim);
-                scaled_dot_product(attn_out, q, k, v, nullptr, scale, false);
+                int cur_seq = pos + 1;
+                float scale = 1.f / sqrtf((float)head_dim);
+
+                // Build full K/V from cache + current (contiguous per-position layout)
+                Tensor k_full = Tensor({(size_t)cur_seq, (size_t)kv_dim_total}, Dtype::kF32);
+                Tensor v_full = Tensor({(size_t)cur_seq, (size_t)kv_dim_total}, Dtype::kF32);
+                std::memcpy(k_full.f32(), state_.k_cache[l].f32(), cur_seq * kv_row * sizeof(float));
+                std::memcpy(v_full.f32(), state_.v_cache[l].f32(), cur_seq * kv_row * sizeof(float));
+
+                // GQA: expand from n_kv_heads to n_heads
+                int n_rep = n_heads / n_kv_heads;
+                Tensor k_exp = Tensor({(size_t)n_heads, (size_t)cur_seq, (size_t)head_dim}, Dtype::kF32);
+                Tensor v_exp = Tensor({(size_t)n_heads, (size_t)cur_seq, (size_t)head_dim}, Dtype::kF32);
+                Tensor q_exp = Tensor({(size_t)n_heads, (size_t)cur_seq, (size_t)head_dim}, Dtype::kF32);
+
+                for (int g = 0; g < n_kv_heads; g++) {
+                    for (int r = 0; r < n_rep; r++) {
+                        int h_dst = g * n_rep + r;
+                        for (int s = 0; s < cur_seq; s++) {
+                            // Correct cache indexing: cache[s * kv_row + g * head_dim + d]
+                            std::memcpy(k_exp.f32() + h_dst * cur_seq * head_dim + s * head_dim,
+                                        state_.k_cache[l].f32() + s * kv_row + g * head_dim,
+                                        head_dim * sizeof(float));
+                            std::memcpy(v_exp.f32() + h_dst * cur_seq * head_dim + s * head_dim,
+                                        state_.v_cache[l].f32() + s * kv_row + g * head_dim,
+                                        head_dim * sizeof(float));
+                        }
+                    }
+                }
+                // Pad Q: repeat single token across positions
+                for (int h = 0; h < n_heads; h++)
+                    for (int s = 0; s < cur_seq; s++)
+                        std::memcpy(q_exp.f32() + h * cur_seq * head_dim + s * head_dim,
+                                    q.f32() + h * head_dim, head_dim * sizeof(float));
+
+                scaled_dot_product(attn_out, q_exp, k_exp, v_exp, nullptr, scale, true);
             }
 
-            /* -- Output projection -- */
-            Tensor attn_proj = Tensor({(size_t)hidden}, Dtype::kF32);
+            // --- Output projection ---
             if (wo_i >= 0) {
                 Tensor Wo = model_.get_weights(wo_i);
                 Tensor Mo = model_.get_mask(wo_i);
-                if (Mo.data()) {
-                    sparse_linear(attn_proj, attn_out, Wo, Mo, Tensor());
-                } else {
-                    dense_linear(attn_proj, attn_out, Wo, Tensor());
+                Tensor attn_proj = Tensor({(size_t)hidden}, Dtype::kF32);
+                if (Wo.data()) {
+                    if (Mo.data())
+                        sparse_linear(attn_proj, attn_out, Wo, Mo, Tensor());
+                    else
+                        dense_linear(attn_proj, attn_out, Wo, Tensor());
+                    residual_add(state_.x, attn_proj, state_.x);
                 }
             }
 
-            /* -- Residual add after attention -- */
-            residual_add(state_.x, attn_proj, x_before_attn);
-
-            /* -- RMSNorm before MLP -- */
-            Tensor rms_weight_post = pn_i >= 0 ? model_.get_weights(pn_i) : Tensor();
+            // --- RMSNorm before MLP ---
+            Tensor rms_w2 = pn_i >= 0 ? model_.get_weights(pn_i) : Tensor();
             Tensor x_mlp = Tensor({(size_t)hidden}, Dtype::kF32);
-            rms_norm(x_mlp, state_.x, rms_weight_post, cfg.norm_eps);
+            rms_norm(x_mlp, state_.x, rms_w2, cfg.norm_eps);
 
-            /* -- Copy residual -- */
-            Tensor x_before_mlp = Tensor({(size_t)hidden}, Dtype::kF32);
-            std::memcpy(x_before_mlp.f32(), state_.x.f32(), hidden * sizeof(float));
-
-            /* -- MLP: gate * silu(up) then down -- */
-            Tensor gate_out = Tensor({(size_t)cfg.intermediate_size}, Dtype::kF32);
-            Tensor up_out = Tensor({(size_t)cfg.intermediate_size}, Dtype::kF32);
-
-            if (wg_i >= 0 && wu_i >= 0) {
+            // --- MLP: Gate/Up → SiLU → Down ---
+            if (wg_i >= 0 && wu_i >= 0 && wd_i >= 0) {
                 Tensor Wg = model_.get_weights(wg_i);
-                Tensor Mg = model_.get_mask(wg_i);
                 Tensor Wu = model_.get_weights(wu_i);
-                Tensor Mu = model_.get_mask(wu_i);
-
-                if (Mg.data()) {
-                    sparse_linear(gate_out, x_mlp, Wg, Mg, Tensor());
-                } else {
-                    dense_linear(gate_out, x_mlp, Wg, Tensor());
-                }
-
-                silu(gate_out, gate_out);
-
-                if (Mu.data()) {
-                    sparse_linear(up_out, x_mlp, Wu, Mu, Tensor());
-                } else {
-                    dense_linear(up_out, x_mlp, Wu, Tensor());
-                }
-
-                /* Element-wise multiply */
-                for (int j = 0; j < cfg.intermediate_size; j++) {
-                    gate_out.f32()[j] *= up_out.f32()[j];
-                }
-
-                /* Down projection */
-                Tensor mlp_out = Tensor({(size_t)hidden}, Dtype::kF32);
-                if (wd_i >= 0) {
-                    Tensor Wd = model_.get_weights(wd_i);
-                    Tensor Md = model_.get_mask(wd_i);
-                    if (Md.data()) {
-                        sparse_linear(mlp_out, gate_out, Wd, Md, Tensor());
-                    } else {
-                        dense_linear(mlp_out, gate_out, Wd, Tensor());
+                Tensor Wd = model_.get_weights(wd_i);
+                if (Wg.data() && Wu.data()) {
+                    Tensor gate = Tensor({(size_t)cfg.intermediate_size}, Dtype::kF32);
+                    Tensor up   = Tensor({(size_t)cfg.intermediate_size}, Dtype::kF32);
+                    dense_linear(gate, x_mlp, Wg, Tensor());
+                    dense_linear(up, x_mlp, Wu, Tensor());
+                    silu(gate, gate);
+                    for (size_t i = 0; i < (size_t)cfg.intermediate_size; i++)
+                        gate.f32()[i] *= up.f32()[i];
+                    if (Wd.data()) {
+                        Tensor mlp_out = Tensor({(size_t)hidden}, Dtype::kF32);
+                        dense_linear(mlp_out, gate, Wd, Tensor());
+                        residual_add(state_.x, mlp_out, state_.x);
                     }
                 }
-
-                /* Residual add after MLP */
-                residual_add(state_.x, mlp_out, x_before_mlp);
             }
         }
 
-        /* -- Final RMSNorm -- */
-        int final_norm_idx = model_.find_layer("model.norm.weight");
-        if (final_norm_idx >= 0) {
-            Tensor final_norm = model_.get_weights(final_norm_idx);
-            rms_norm(state_.x, state_.x, final_norm, cfg.norm_eps);
+        // --- Final RMSNorm ---
+        int fn_i = -1;
+        for (auto& name : {"model.norm.weight", "transformer.ln_f.weight", "transformer.norm.weight"}) {
+            fn_i = model_.find_layer(name);
+            if (fn_i >= 0) break;
         }
+        Tensor fn_w = fn_i >= 0 ? model_.get_weights(fn_i) : Tensor();
+        rms_norm(state_.x, state_.x, fn_w, cfg.norm_eps);
 
-        /* -- LM head -- */
-        int lm_head_idx = model_.find_layer("lm_head.weight");
-        if (lm_head_idx < 0) {
-            lm_head_idx = model_.find_layer("model.embed_tokens.weight");
+        // --- LM head ---
+        int lm_i = -1;
+        for (auto& name : {"lm_head.weight", "model.embed_tokens.weight", "transformer.wte.weight"}) {
+            lm_i = model_.find_layer(name);
+            if (lm_i >= 0) break;
         }
-        if (lm_head_idx >= 0) {
-            Tensor lm_head = model_.get_weights(lm_head_idx);
-            logits_ = Tensor({(size_t)cfg.vocab_size}, Dtype::kF32);
-            dense_linear(logits_, state_.x, lm_head, Tensor());
+        if (lm_i >= 0) {
+            Tensor Wlm = model_.get_weights(lm_i);
+            if (Wlm.data()) {
+                Tensor logits = Tensor({(size_t)cfg.vocab_size}, Dtype::kF32);
+                dense_linear(logits, state_.x, Wlm, Tensor());
+                std::memcpy(state_.x.f32(), logits.f32(), cfg.vocab_size * sizeof(float));
+            }
         }
 
         state_.seq_pos++;
-        return logits_.f32();
-    }
-
-    /* Get current logits */
-    const float* logits() const { return logits_.f32(); }
-
-    /* Get vocab size */
-    int vocab_size() const { return model_.config().vocab_size; }
-
-    /* Reset state for a new sequence */
-    void reset() {
-        state_.seq_pos = 0;
-        if (state_.x.data()) memset(state_.x.f32(), 0, state_.x.bytes());
+        return state_.x.f32();
     }
 
 private:
-    std::string fmt_layer_name(int layer, const char* suffix) {
-        char buf[256];
-        snprintf(buf, sizeof(buf), "model.layers.%d.%s", layer, suffix);
-        return std::string(buf);
+    std::string fmt_layer_name(int layer, const char* component) {
+        return "model.layers." + std::to_string(layer) + "." + component;
     }
 
     const Model& model_;
     RunState     state_;
-    Tensor       logits_;
 };
 
 }  // namespace run
 }  // namespace tensorbit
-
-#endif /* TENSORBIT_RUN_OPS_HPP */

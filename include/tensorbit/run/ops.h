@@ -20,6 +20,11 @@ extern "C" {
  * y: [out_features]
  * ================================================================ */
 
+typedef struct {
+    int nm_n;
+    int nm_m;
+} TbLinearParams;
+
 int tb_cpu_sparse_linear_f32(size_t out_features, size_t in_features,
                               const float* TB_RESTRICT x,
                               const float* TB_RESTRICT w,
@@ -122,6 +127,12 @@ int tb_cpu_rope_f32(int n_heads, int seq_len, int head_dim,
                      float* TB_RESTRICT q,
                      float* TB_RESTRICT k,
                      int position, float theta_base);
+
+/* GQA-aware RoPE: q and k may have different head counts */
+int tb_cpu_rope_gqa_f32(int n_q_heads, int n_kv_heads, int head_dim,
+                         float* TB_RESTRICT q,
+                         float* TB_RESTRICT k,
+                         int position, float theta_base);
 
 /* ================================================================
  * Residual Add

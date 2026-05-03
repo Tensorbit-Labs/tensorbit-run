@@ -478,6 +478,7 @@ int main(int argc, char** argv) {
 
     /* Setup runner */
     TransformerRunner runner(model);
+    runner.init_state();
 
     /* Encode prompt */
     std::vector<int> token_ids = tokenizer.encode(prompt);

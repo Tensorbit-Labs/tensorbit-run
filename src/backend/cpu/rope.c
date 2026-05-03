@@ -8,12 +8,13 @@ int tb_cpu_rope_dispatch(void* output, const void** inputs, int n_inputs, const 
     TbTensor* q = (TbTensor*)output;
     TbTensor* k = (TbTensor*)inputs[0];
 
-    int n_heads = (int)q->shape[0];
-    int seq_len = (int)q->shape[1];
+    int n_q_heads = (int)q->shape[0];
+    int n_kv_heads = (int)k->shape[0];
     int head_dim = (int)q->shape[2];
 
     (void)n_inputs;
 
-    return tb_cpu_rope_f32(n_heads, seq_len, head_dim, tb_tensor_f32(q), tb_tensor_f32(k),
-                            rp->position, rp->theta);
+    return tb_cpu_rope_gqa_f32(n_q_heads, n_kv_heads, head_dim,
+                               tb_tensor_f32(q), tb_tensor_f32(k),
+                               rp->position, rp->theta);
 }

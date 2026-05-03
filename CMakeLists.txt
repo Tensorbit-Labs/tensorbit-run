@@ -49,6 +49,16 @@ endif()
 
 if(TENSORBIT_BACKEND_CUDA)
     add_definitions(-DTB_HAS_CUDA=1)
+    list(APPEND TBRUN_C_SOURCES src/backend/cuda/registry.c)
+    # Enable CUDA language for kernels.cu compilation
+    enable_language(CUDA)
+    set(CMAKE_CUDA_STANDARD 17)
+    set(CMAKE_CUDA_ARCHITECTURES "80;90")
+    find_package(CUDAToolkit 12.0 REQUIRED)
+    # Add CUDA kernels as a separate static lib
+    add_library(tensorbit-run-cuda STATIC src/backend/cuda/kernels.cu)
+    target_include_directories(tensorbit-run-cuda PUBLIC ${CMAKE_CURRENT_SOURCE_DIR}/include)
+    target_link_libraries(tensorbit-run-cuda PUBLIC CUDA::cudart tensorbit-run-c)
 endif()
 
 if(TENSORBIT_BACKEND_METAL)
@@ -66,6 +76,7 @@ endif()
 # --- C Core Library (pure C11, no STL, no exceptions, no RTTI) ---
 set(TBRUN_C_SOURCES
     src/model.c
+    src/model_esp32.c
     src/ops/linear.c
     src/ops/norm.c
     src/ops/activation.c
@@ -97,6 +108,9 @@ add_library(tensorbit-run-c STATIC
 target_include_directories(tensorbit-run-c PUBLIC
     ${CMAKE_CURRENT_SOURCE_DIR}/include
 )
+if(UNIX)
+    target_link_libraries(tensorbit-run-c PUBLIC m)
+endif()
 # No C++-specific flags for C library
 
 # --- C++ Wrapper Library ---
@@ -115,6 +129,9 @@ target_link_libraries(tensorbit-run-cpp PUBLIC tensorbit-run-c)
 # --- Executable ---
 add_executable(tb-run src/main.cpp)
 target_link_libraries(tb-run PRIVATE tensorbit-run-cpp)
+if(TENSORBIT_BACKEND_CUDA)
+    target_link_libraries(tb-run PRIVATE tensorbit-run-cuda)
+endif()
 target_compile_definitions(tb-run PRIVATE $<$<CONFIG:Debug>:TB_DEBUG>)
 
 # --- Tests ---
