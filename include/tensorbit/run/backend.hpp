@@ -27,7 +27,11 @@ public:
     void init() {
         if (initialized_) return;
         initialized_ = true;
+
         tb_backend_cpu_init();
+#ifdef TB_HAS_CUDA
+        tb_backend_cuda_init();
+#endif
     }
 
     /* Check if a backend is available */

@@ -282,7 +282,7 @@ __global__ void sdp_attention_kernel(
     const float* vh = v + h * kv_len * head_dim;
 
     // Compute softmax scores for row si
-    __shared__ float s_max[256], s_sum[256];
+    __shared__ float s_max[256];
     float max_val = -INFINITY;
 
     for (int j = threadIdx.x; j < kv_len; j += blockDim.x) {
@@ -311,15 +311,16 @@ __global__ void sdp_attention_kernel(
             score += qh[si * head_dim + d] * kh[j * head_dim + d];
         score = (causal && j > si) ? -INFINITY : score * scale;
         float w = expf(score - max_val);
-        if (threadIdx.x == 0) total += w;
+        total += w;
         acc += w * vh[j * head_dim + di];
     }
-    for (int d = blockDim.x/2; d > 0; d >>= 1)
+    // Warp-reduce both total and acc
+    for (int d = 16; d > 0; d >>= 1) {
+        total += __shfl_down_sync(0xffffffff, total, d);
         acc += __shfl_down_sync(0xffffffff, acc, d);
-    if (threadIdx.x == 0) {
-        for (int d = blockDim.x/2; d > 0; d >>= 1)
-            total += __shfl_down_sync(0xffffffff, total, d);
     }
+    total = __shfl_sync(0xffffffff, total, 0);
+    acc = __shfl_sync(0xffffffff, acc, 0);
     acc /= (total > 0.f ? total : 1.f);
     y[idx] = acc;
 }

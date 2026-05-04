@@ -12,8 +12,8 @@
 
 #include <string.h>
 
-// CUDA kernel declarations (defined in kernels.cu)
-extern "C" {
+// CUDA kernel declarations (defined in kernels.cu, callable from C via C++ link)
+// Inlined here as extern function prototypes — actual symbols resolved by linker.
 int tb_cuda_sparse_linear_f32(float*, const float*, const float*, const uint8_t*,
                                size_t, size_t, int, int);
 int tb_cuda_dense_linear_f32(float*, const float*, const float*, const float*,
@@ -30,8 +30,7 @@ int tb_cuda_layer_norm_f32(float*, const float*, const float*, const float*,
 int tb_cuda_conv2d_f32(float*, const float*, const float*, const float*,
                         int, int, int, int, int, int, int, int);
 int tb_cuda_sdp_attention_f32(float*, const float*, const float*, const float*,
-                               int, int, int, int, float, bool);
-}
+                               int, int, int, int, float, _Bool);
 
 // ================================================================
 // CUDA dispatch wrappers

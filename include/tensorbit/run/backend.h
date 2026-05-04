@@ -142,6 +142,11 @@ int tb_dispatch_conv2d(TbTensor* y, const TbTensor* x, const TbTensor* kernel,
 /* Initialize the CPU backend (always available) */
 int tb_backend_cpu_init(void);
 
+/* Initialize the CUDA backend (requires TB_HAS_CUDA) */
+#ifdef TB_HAS_CUDA
+int tb_backend_cuda_init(void);
+#endif
+
 #ifdef __cplusplus
 }
 #endif

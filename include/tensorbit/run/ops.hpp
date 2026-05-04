@@ -181,7 +181,9 @@ public:
             }
 
             // --- Attention ---
-            Tensor attn_out = Tensor({(size_t)q_dim}, Dtype::kF32);
+            int attn_out_size = q_dim;  // prefill: 1 token
+            if (pos > 0) attn_out_size *= (pos + 1);  // decode: cur_seq tokens
+            Tensor attn_out = Tensor({(size_t)attn_out_size}, Dtype::kF32);
 
             if (pos == 0) {
                 float scale = 1.f / sqrtf((float)head_dim);
@@ -189,12 +191,6 @@ public:
             } else {
                 int cur_seq = pos + 1;
                 float scale = 1.f / sqrtf((float)head_dim);
-
-                // Build full K/V from cache + current (contiguous per-position layout)
-                Tensor k_full = Tensor({(size_t)cur_seq, (size_t)kv_dim_total}, Dtype::kF32);
-                Tensor v_full = Tensor({(size_t)cur_seq, (size_t)kv_dim_total}, Dtype::kF32);
-                std::memcpy(k_full.f32(), state_.k_cache[l].f32(), cur_seq * kv_row * sizeof(float));
-                std::memcpy(v_full.f32(), state_.v_cache[l].f32(), cur_seq * kv_row * sizeof(float));
 
                 // GQA: expand from n_kv_heads to n_heads
                 int n_rep = n_heads / n_kv_heads;
@@ -249,17 +245,32 @@ public:
                 Tensor Wg = model_.get_weights(wg_i);
                 Tensor Wu = model_.get_weights(wu_i);
                 Tensor Wd = model_.get_weights(wd_i);
+                Tensor Mg = model_.get_mask(wg_i);
+                Tensor Mu = model_.get_mask(wu_i);
+                Tensor Md = model_.get_mask(wd_i);
                 if (Wg.data() && Wu.data()) {
                     Tensor gate = Tensor({(size_t)cfg.intermediate_size}, Dtype::kF32);
                     Tensor up   = Tensor({(size_t)cfg.intermediate_size}, Dtype::kF32);
-                    dense_linear(gate, x_mlp, Wg, Tensor());
-                    dense_linear(up, x_mlp, Wu, Tensor());
+                    if (Mg.data()) {
+                        sparse_linear(gate, x_mlp, Wg, Mg, Tensor());
+                    } else {
+                        dense_linear(gate, x_mlp, Wg, Tensor());
+                    }
+                    if (Mu.data()) {
+                        sparse_linear(up, x_mlp, Wu, Mu, Tensor());
+                    } else {
+                        dense_linear(up, x_mlp, Wu, Tensor());
+                    }
                     silu(gate, gate);
                     for (size_t i = 0; i < (size_t)cfg.intermediate_size; i++)
                         gate.f32()[i] *= up.f32()[i];
                     if (Wd.data()) {
                         Tensor mlp_out = Tensor({(size_t)hidden}, Dtype::kF32);
-                        dense_linear(mlp_out, gate, Wd, Tensor());
+                        if (Md.data()) {
+                            sparse_linear(mlp_out, gate, Wd, Md, Tensor());
+                        } else {
+                            dense_linear(mlp_out, gate, Wd, Tensor());
+                        }
                         residual_add(state_.x, mlp_out, state_.x);
                     }
                 }
