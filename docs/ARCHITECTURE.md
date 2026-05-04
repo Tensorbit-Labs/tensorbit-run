@@ -183,7 +183,3 @@ must be lvalues** — no literals, no ternaries, no arithmetic expressions.
 | Activations (1 token) | ~16 KB | Per-layer buffers reused |
 | **Engine binary** | ~50 KB | C core stripped |
 | **Total runtime overhead** | ~2 GB + model size | Zero-copy for weights |
-
-## License
-
-Apache License 2.0 — Tensorbit Labs
