@@ -52,10 +52,16 @@ static int tb_file_open_read(const char* path, TbFileMapping* fm) {
     fm->size = (size_t)st.st_size;
     fm->data = mmap(NULL, fm->size, PROT_READ, MAP_PRIVATE, fm->fd, 0);
     if (fm->data == MAP_FAILED) {
-        // mmap failed — fall back to malloc + read for environments
-        // where mmap is unreliable (e.g. WSL2 DrvFs / 9p for large files)
+        double size_gb = (double)fm->size / (1024.0 * 1024.0 * 1024.0);
+        TB_LOG_WARN("%.1f GB file — mmap failed, falling back to read", size_gb);
         fm->data = tb_malloc(fm->size);
-        if (!fm->data) { close(fm->fd); return TB_ERR_OOM; }
+        if (!fm->data) {
+            TB_LOG_ERROR("cannot allocate %.1f GB for model load", size_gb);
+            TB_LOG_ERROR("increase WSL2 memory: create %%USERPROFILE%%\\.wslconfig with [wsl2]\\nmemory=48GB");
+            TB_LOG_ERROR("then run 'wsl --shutdown' from PowerShell and restart this terminal");
+            close(fm->fd);
+            return TB_ERR_OOM;
+        }
         size_t total = 0;
         while (total < fm->size) {
             ssize_t n = read(fm->fd, (char*)fm->data + total,
@@ -67,6 +73,7 @@ static int tb_file_open_read(const char* path, TbFileMapping* fm) {
         fm->owns_data = 1;
         close(fm->fd);
         fm->fd = -1;
+        TB_LOG_INFO("model loaded via fallback read (%.1f GB)", size_gb);
     }
 #endif
     return TB_OK;
