@@ -28,6 +28,7 @@ typedef struct {
 #endif
     size_t size;
     void*  data;
+    int    owns_data;  // 1 = data allocated via malloc (mmap fallback)
 } TbFileMapping;
 
 static int tb_file_open_read(const char* path, TbFileMapping* fm) {
@@ -50,7 +51,23 @@ static int tb_file_open_read(const char* path, TbFileMapping* fm) {
     if (fstat(fm->fd, &st) != 0) { close(fm->fd); return TB_ERR_FILE_READ; }
     fm->size = (size_t)st.st_size;
     fm->data = mmap(NULL, fm->size, PROT_READ, MAP_PRIVATE, fm->fd, 0);
-    if (fm->data == MAP_FAILED) { close(fm->fd); return TB_ERR_FILE_OPEN; }
+    if (fm->data == MAP_FAILED) {
+        // mmap failed — fall back to malloc + read for environments
+        // where mmap is unreliable (e.g. WSL2 DrvFs / 9p for large files)
+        fm->data = tb_malloc(fm->size);
+        if (!fm->data) { close(fm->fd); return TB_ERR_OOM; }
+        size_t total = 0;
+        while (total < fm->size) {
+            ssize_t n = read(fm->fd, (char*)fm->data + total,
+                             fm->size - total);
+            if (n <= 0) { tb_free(fm->data); fm->data = NULL;
+                          close(fm->fd); return TB_ERR_FILE_READ; }
+            total += (size_t)n;
+        }
+        fm->owns_data = 1;
+        close(fm->fd);
+        fm->fd = -1;
+    }
 #endif
     return TB_OK;
 }
@@ -62,8 +79,12 @@ static void tb_file_close(TbFileMapping* fm) {
     CloseHandle(fm->mapping);
     CloseHandle(fm->handle);
 #else
-    munmap(fm->data, fm->size);
-    close(fm->fd);
+    if (fm->owns_data) {
+        tb_free(fm->data);
+    } else {
+        munmap(fm->data, fm->size);
+    }
+    if (fm->fd >= 0) close(fm->fd);
 #endif
     fm->data = NULL;
 }

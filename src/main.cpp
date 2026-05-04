@@ -441,7 +441,8 @@ int main(int argc, char** argv) {
         auto result = Model::load_tbm(model_path);
         if (!result) {
             auto mp = model_path.c_str();
-            TB_LOG_ERROR("failed to load model from {}", mp);
+            auto ec = static_cast<int>(result.error());
+            TB_LOG_ERROR("failed to load model from {} (error code: {})", mp, ec);
             return 1;
         }
         model = std::move(*result);
@@ -449,7 +450,8 @@ int main(int argc, char** argv) {
         auto result = Model::load_dir(model_dir);
         if (!result) {
             auto md = model_dir.c_str();
-            TB_LOG_ERROR("failed to load model from {}", md);
+            auto ec = static_cast<int>(result.error());
+            TB_LOG_ERROR("failed to load model from {} (error code: {})", md, ec);
             return 1;
         }
         model = std::move(*result);
