@@ -105,13 +105,24 @@ int tb_model_load_tbm(TbModel* model, const char* path) {
     json[index_len] = '\0';
 
     /* Parse JSON index — hand-rolled parser (shared with model.c) */
-    json[index_len] = '\0';
-    int ret = parse_tbm_json(model, json);
+    TbModelConfig config;
+    int num_layers = 0;
+    TbLayerDesc layers_buf[512];
+    int ret = tb_parse_tbm_index(json, index_len, &config, layers_buf, 512, &num_layers);
     tb_free(json);
     if (ret != TB_OK) return ret;
 
-    /* Read each layer's .tb header to determine offsets */
-    for (int i = 0; i < model->num_layers; i++) {
+    model->config = config;
+    model->num_layers = num_layers;
+    model->layers = NULL;  /* ESP32 uses flash-based tensors, not mmap pointers */
+
+    /* Allocate and copy layer descriptors */
+    model->layers = (TbLayerDesc*)tb_malloc((size_t)num_layers * sizeof(TbLayerDesc));
+    if (!model->layers) return TB_ERR_OOM;
+    memcpy(model->layers, layers_buf, (size_t)num_layers * sizeof(TbLayerDesc));
+
+    /* Read each layer's .tb header to populate weight/mask metadata */
+    for (int i = 0; i < num_layers; i++) {
         TbLayerDesc* layer = &model->layers[i];
         TBHeader    hdr;
         rc = tb_flash_seek(&ff, layer->tbm_offset);
@@ -119,15 +130,13 @@ int tb_model_load_tbm(TbModel* model, const char* path) {
         rc = tb_flash_read(&ff, &hdr, TB_HEADER_SIZE);
         if (rc != TB_OK) return rc;
         if (hdr.magic != TB_MAGIC) return TB_ERR_BAD_MAGIC;
-        layer->num_weights   = (size_t)hdr.num_weights;
+        layer->num_weights    = (size_t)hdr.num_weights;
         layer->num_mask_bytes = (size_t)hdr.num_mask_bytes;
-        layer->weights_offset = layer->tbm_offset + (size_t)hdr.weights_offset;
-        layer->masks_offset   = layer->tbm_offset + (size_t)hdr.masks_offset;
         layer->nm_n = hdr.nm_n;
         layer->nm_m = hdr.nm_m;
     }
 
-    model->owns_mapping = true;
+    model->owns_mapping = 0;
     model->mapped_data  = NULL;  // ESP32 reads on-demand from flash
 
     return TB_OK;
@@ -144,7 +153,10 @@ int tb_model_get_weight_tensor(TbModel* model, int index, TbTensor* out) {
     TbFlashFile ff;
     int rc = tb_flash_open(&ff);
     if (rc != TB_OK) { tb_free(out->data); return rc; }
-    rc = tb_flash_seek(&ff, layer->weights_offset);
+
+    /* Weights start after the 4096-byte TBHeader at tbm_offset */
+    size_t woff = layer->tbm_offset + TB_HEADER_SIZE;
+    rc = tb_flash_seek(&ff, woff);
     if (rc != TB_OK) { tb_free(out->data); return rc; }
     rc = tb_flash_read(&ff, out->data, layer->num_weights * sizeof(float));
     if (rc != TB_OK) { tb_free(out->data); return rc; }
@@ -153,8 +165,8 @@ int tb_model_get_weight_tensor(TbModel* model, int index, TbTensor* out) {
     out->shape[1] = layer->shape[1];
     out->rank = 2;
     out->dtype = TB_DTYPE_F32;
-    out->device = TB_DEVICE_HOST;
-    out->owns_data = true;
+    out->device = TB_DEVICE_CPU;
+    out->owns_data = 1;
 
     return TB_OK;
 }

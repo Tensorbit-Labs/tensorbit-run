@@ -57,8 +57,7 @@ static int tb_file_open_read(const char* path, TbFileMapping* fm) {
         fm->data = tb_malloc(fm->size);
         if (!fm->data) {
             TB_LOG_ERROR("cannot allocate %.1f GB for model load", size_gb);
-            TB_LOG_ERROR("increase WSL2 memory: create %%USERPROFILE%%\\.wslconfig with [wsl2]\\nmemory=48GB");
-            TB_LOG_ERROR("then run 'wsl --shutdown' from PowerShell and restart this terminal");
+            TB_LOG_ERROR("increase system virtual memory or add swap space");
             close(fm->fd);
             return TB_ERR_OOM;
         }

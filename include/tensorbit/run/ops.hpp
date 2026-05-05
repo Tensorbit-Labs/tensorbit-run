@@ -37,7 +37,7 @@ public:
         int  hidden = cfg.hidden_size > 0 ? cfg.hidden_size : 512;
         int  n_layers = cfg.num_layers > 0 ? cfg.num_layers : 1;
 
-        state_.x = Tensor({(size_t)hidden}, Dtype::kF32);
+        state_.x = Tensor({(size_t)std::max(hidden, cfg.vocab_size)}, Dtype::kF32);
         state_.residual = Tensor({(size_t)hidden}, Dtype::kF32);
         state_.seq_pos = 0;
 

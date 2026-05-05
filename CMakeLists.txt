@@ -53,7 +53,9 @@ if(TENSORBIT_BACKEND_CUDA)
     # Enable CUDA language for kernels.cu compilation
     enable_language(CUDA)
     set(CMAKE_CUDA_STANDARD 17)
-    set(CMAKE_CUDA_ARCHITECTURES "80;90")
+    if(NOT DEFINED CMAKE_CUDA_ARCHITECTURES)
+        set(CMAKE_CUDA_ARCHITECTURES "80;90")
+    endif()
     find_package(CUDAToolkit 12.0 REQUIRED)
     # Add CUDA kernels as a separate static lib
     add_library(tensorbit-run-cuda STATIC src/backend/cuda/kernels.cu)

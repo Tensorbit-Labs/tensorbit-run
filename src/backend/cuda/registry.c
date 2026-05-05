@@ -194,7 +194,6 @@ int tb_backend_cuda_init(void) {
     memset(be, 0, sizeof(*be));
 
     be->name     = "cuda";
-    be->type     = TB_BACKEND_CUDA;
     be->priority = 100;
 
     be->ops[TB_OP_SPARSE_LINEAR]      = cuda_linear_s;
@@ -209,7 +208,7 @@ int tb_backend_cuda_init(void) {
     be->ops[TB_OP_EMBEDDING]          = cuda_embedding;
     be->ops[TB_OP_RESIDUAL_ADD]       = cuda_residual;
     be->ops[TB_OP_CONV2D]             = cuda_conv2d;
-    be->ops[TB_OP_ATTENTION_QKV]      = nullptr;
+    be->ops[TB_OP_ATTENTION_QKV]      = NULL;
 
     return tb_backend_register(be);
 }

@@ -104,7 +104,8 @@ static int sample_temperature(const float* logits, int n, float temperature) {
 
     for (int i = 0; i < n; i++) probs[i] /= sum;
 
-    static std::mt19937                          rng(42);
+    static std::random_device              rd;
+    static std::mt19937                     rng(rd());
     std::discrete_distribution<int> dist(probs.begin(), probs.end());
     return dist(rng);
 }
