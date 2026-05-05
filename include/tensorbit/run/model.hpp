@@ -163,6 +163,63 @@ public:
         return Tensor::wrap(t.data, {t.shape[0]}, Dtype::kU8, DeviceLocation::kHost);
     }
 
+    /* Get scale tensor (zero-copy view). Returns empty tensor on error. */
+    Tensor get_scales(int idx) const {
+        TbTensor t;
+        int      ret = tb_model_get_scale_tensor(&model_, idx, &t);
+        if (ret != TB_OK) return Tensor();
+        return Tensor::wrap(t.data, {t.shape[0]}, Dtype::kF32, DeviceLocation::kHost);
+    }
+
+    /* Get weight tensor, dequantizing INT4/INT8 to FP32 automatically.
+       FP32 weights are returned zero-copy.  INT4/INT8 allocate a temp
+       FP32 buffer that is freed when the tensor is destroyed. */
+    Tensor get_weight_fp32(int idx) const {
+        TbTensor t;
+        int      ret = tb_model_get_weight_tensor(&model_, idx, &t);
+        if (ret != TB_OK) return Tensor();
+
+        TbDtype wdt = t.dtype;
+        if (wdt != TB_DTYPE_INT4 && wdt != TB_DTYPE_INT8) {
+            return Tensor::wrap(t.data, {t.shape[0], t.shape[1]},
+                                 static_cast<Dtype>(wdt), DeviceLocation::kHost);
+        }
+
+        /* ---- INT4 / INT8 dequant ---- */
+        TbTensor sc;
+        ret = tb_model_get_scale_tensor(&model_, idx, &sc);
+        if (ret != TB_OK) return Tensor();
+
+        const TbLayerDesc& layer = model_.layers[idx];
+        size_t n = layer.num_weights;
+        uint32_t gs = layer.group_size > 0 ? layer.group_size : (uint32_t)n;
+
+        Tensor f32w({layer.shape[0], layer.shape[1]}, Dtype::kF32);
+        float* dst = f32w.f32();
+        const float* scl = (const float*)sc.data;
+
+        if (wdt == TB_DTYPE_INT4) {
+            const uint8_t* src = (const uint8_t*)t.data;
+            for (size_t i = 0; i < n; ++i) {
+                size_t g = i / gs;
+                float scale = (g < sc.shape[0]) ? scl[g] : 1.0f;
+                size_t pi = i / 2;
+                uint8_t b = src[pi];
+                int nib = (i & 1) ? (b >> 4) : (b & 0xF);
+                dst[i] = (nib & 8) ? (float)(nib - 16) * scale : (float)nib * scale;
+            }
+        } else { /* INT8 */
+            const int8_t* src = (const int8_t*)t.data;
+            for (size_t i = 0; i < n; ++i) {
+                size_t g = i / gs;
+                float scale = (g < sc.shape[0]) ? scl[g] : 1.0f;
+                dst[i] = (float)src[i] * scale;
+            }
+        }
+
+        return f32w;
+    }
+
     /* Raw C handle */
     TbModel*       c_model() { return &model_; }
     const TbModel* c_model() const { return &model_; }

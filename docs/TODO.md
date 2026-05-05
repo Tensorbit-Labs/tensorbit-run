@@ -159,23 +159,37 @@ MinGW builds return deterministic values). Consider fallback to
 
 ---
 
-## 9. Dtypes: Only FP32 weights supported for inference
+## 9. Dtypes: Only FP32 weights natively supported (INT4 dequant added May 2026)
 
-**Files:** `src/ops/linear.c`, `src/backend/cpu/linear.c`, `src/backend/cuda/registry.c`
+**Files:** `include/.../model.hpp`, `include/.../model.h`, `src/model.c`, `include/.../ops.hpp`
 
 ### Current state
-All linear algebra kernels assume `float*` inputs. The .tbm format
-supports `fp32`, `fp16`, `bf16`, `fp64`, and future dtypes (`int4`,
-`int8`). But tensorbit-run currently only works with FP32 weights.
+All linear algebra kernels assume `float*` inputs. The .tbm format supports
+`fp32`, `fp16`, `bf16`, `fp64`, `int4`, `int8`. **INT4 is now supported** via
+`Model::get_weight_fp32()` which dequantizes INT4/INT8 weights to FP32 at
+load time. No kernel changes were needed — dequantization happens before the
+linear dispatch, producing a temporary FP32 tensor consumed by existing kernels.
 
-### Suggested fix
-- **FP16/BF16**: Add dequantization kernels that convert weight buffers
-  on-the-fly during the dense/sparse linear dispatch. Acceptable overhead
-  (~5-10% slower) for immediate support.
-- **INT8**: Add per-channel scale handling. The `.tbm` JSON index will
-  need a `scale` field per tensor (to be added by tensorbit-quant).
-- **INT4**: Pack 2 elements per byte. Decompress in the linear kernel.
-  Critical for running 7B models on consumer hardware (< 8 GB RAM).
+### What's done
+- `TbDtype` enum: added `TB_DTYPE_INT8 = 7`, `TB_DTYPE_INT4 = 8`
+- `TbLayerDesc`: added `scale_count` and `group_size` fields
+- `tb_model_get_scale_tensor()`: zero-copy access to scale data in the mmap
+- `Model::get_weight_fp32()`: returns FP32 weights for any dtype.
+  FP32 → zero-copy view. INT4/INT8 → allocates temp buffer, dequantizes.
+- `ops.hpp`: all `get_weights()` calls replaced with `get_weight_fp32()`
+- JSON parser in `model.c`: recognizes `"int4"`/`"int8"` dtype strings,
+  parses `scale_count` and `group_size` fields
+
+### Remaining
+- **FP16/BF16**: Same approach — add dequant branch in `get_weight_fp32()`.
+  FP16 uses IEEE 754 half-precision unpacking. BF16 uses bit-shift `u16 << 16`.
+- **Native kernel support**: Currently dequant+GEMM is two passes. A fused
+  INT4 kernel that reads nibbles, multiplies by scales, and accumulates in
+  one pass would be ~20% faster. Deferred until performance profiling.
+- **CUDA INT4**: The CUDA dispatch (`backend/cuda/registry.c`) still expects
+  FP32. Until `get_weight_fp32()` causes the C++ side to pass FP32, this
+  works transparently. But for GPU-side dequant (faster), the CUDA kernels
+  need INT4 support directly.
 
 ---
 
@@ -341,7 +355,7 @@ the model was trained on.
 | 6 | Inconsistent log formatting | Logging | Low |
 | 7 | --temp-dir help/code mismatch | CLI | Low |
 | 8 | Deterministic RNG (fixed) | Sampling | Low |
-| 9 | Only FP32 weights supported | Inference | High |
+| 9 | Only FP32 natively (INT4/INT8 via get_weight_fp32) | Inference | Medium |
 | 10 | CUDA registry untested | Backend | Medium |
 | 11 | ESP32 scaffold incomplete | Platform | High |
 | 12 | 1D tensor shape handling | Memory | Medium |

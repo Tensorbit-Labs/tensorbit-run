@@ -100,7 +100,7 @@ public:
             if (emb_idx >= 0) break;
         }
         if (emb_idx < 0) return nullptr;
-        Tensor emb = model_.get_weights(emb_idx);
+        Tensor emb = model_.get_weight_fp32(emb_idx);
         if (!emb.data()) return nullptr;
         embedding(state_.x, &token_id, 1, emb);
 
@@ -129,7 +129,7 @@ public:
             int pn_i = find_weight_idx(model_, Pn);
 
             // --- RMSNorm before attention ---
-            Tensor rms_w = in_i >= 0 ? model_.get_weights(in_i) : Tensor();
+            Tensor rms_w = in_i >= 0 ? model_.get_weight_fp32(in_i) : Tensor();
             rms_norm(state_.x, state_.x, rms_w, cfg.norm_eps);
 
             // --- QKV projections ---
@@ -140,9 +140,9 @@ public:
             Tensor k = Tensor({(size_t)n_kv_heads, (size_t)1, (size_t)head_dim}, Dtype::kF32);
             Tensor v = Tensor({(size_t)n_kv_heads, (size_t)1, (size_t)head_dim}, Dtype::kF32);
 
-            Tensor Wq = model_.get_weights(wq_i);
-            Tensor Wk = model_.get_weights(wk_i);
-            Tensor Wv = model_.get_weights(wv_i);
+            Tensor Wq = model_.get_weight_fp32(wq_i);
+            Tensor Wk = model_.get_weight_fp32(wk_i);
+            Tensor Wv = model_.get_weight_fp32(wv_i);
             if (!Wq.data() || !Wk.data() || !Wv.data()) continue;
 
             Tensor Mq = model_.get_mask(wq_i);
@@ -223,7 +223,7 @@ public:
 
             // --- Output projection ---
             if (wo_i >= 0) {
-                Tensor Wo = model_.get_weights(wo_i);
+                Tensor Wo = model_.get_weight_fp32(wo_i);
                 Tensor Mo = model_.get_mask(wo_i);
                 Tensor attn_proj = Tensor({(size_t)hidden}, Dtype::kF32);
                 if (Wo.data()) {
@@ -236,15 +236,15 @@ public:
             }
 
             // --- RMSNorm before MLP ---
-            Tensor rms_w2 = pn_i >= 0 ? model_.get_weights(pn_i) : Tensor();
+            Tensor rms_w2 = pn_i >= 0 ? model_.get_weight_fp32(pn_i) : Tensor();
             Tensor x_mlp = Tensor({(size_t)hidden}, Dtype::kF32);
             rms_norm(x_mlp, state_.x, rms_w2, cfg.norm_eps);
 
             // --- MLP: Gate/Up → SiLU → Down ---
             if (wg_i >= 0 && wu_i >= 0 && wd_i >= 0) {
-                Tensor Wg = model_.get_weights(wg_i);
-                Tensor Wu = model_.get_weights(wu_i);
-                Tensor Wd = model_.get_weights(wd_i);
+                Tensor Wg = model_.get_weight_fp32(wg_i);
+                Tensor Wu = model_.get_weight_fp32(wu_i);
+                Tensor Wd = model_.get_weight_fp32(wd_i);
                 Tensor Mg = model_.get_mask(wg_i);
                 Tensor Mu = model_.get_mask(wu_i);
                 Tensor Md = model_.get_mask(wd_i);
@@ -283,7 +283,7 @@ public:
             fn_i = model_.find_layer(name);
             if (fn_i >= 0) break;
         }
-        Tensor fn_w = fn_i >= 0 ? model_.get_weights(fn_i) : Tensor();
+        Tensor fn_w = fn_i >= 0 ? model_.get_weight_fp32(fn_i) : Tensor();
         rms_norm(state_.x, state_.x, fn_w, cfg.norm_eps);
 
         // --- LM head ---
@@ -293,7 +293,7 @@ public:
             if (lm_i >= 0) break;
         }
         if (lm_i >= 0) {
-            Tensor Wlm = model_.get_weights(lm_i);
+            Tensor Wlm = model_.get_weight_fp32(lm_i);
             if (Wlm.data()) {
                 Tensor logits = Tensor({(size_t)cfg.vocab_size}, Dtype::kF32);
                 dense_linear(logits, state_.x, Wlm, Tensor());

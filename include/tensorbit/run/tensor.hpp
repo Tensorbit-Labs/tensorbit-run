@@ -23,7 +23,7 @@ enum class DeviceLocation { kHost = 0, kCuda = 1, kMetal = 2, kVulkan = 3, kNpu 
  * Dtype enum (C++ mirror of C TbDtype)
  * ================================================================ */
 
-enum class Dtype { kF32 = 0, kF16 = 1, kBF16 = 2, kF64 = 3, kI32 = 4, kU8 = 5, kU32 = 6 };
+enum class Dtype { kF32 = 0, kF16 = 1, kBF16 = 2, kF64 = 3, kI32 = 4, kU8 = 5, kU32 = 6, kINT8 = 7, kINT4 = 8 };
 
 inline size_t dtype_size(Dtype dt) {
     switch (dt) {
@@ -41,6 +41,10 @@ inline size_t dtype_size(Dtype dt) {
             return 1;
         case Dtype::kU32:
             return 4;
+        case Dtype::kINT8:
+            return 1;
+        case Dtype::kINT4:
+            return 0;
         default:
             return 0;
     }

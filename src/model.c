@@ -390,10 +390,12 @@ static int tb_json_parse_tensors(TbJsonParser* p, TbLayerDesc* layers, int max_l
             } else if (strcmp(key, "dtype") == 0) {
                 char dtype_str[32];
                 tb_json_parse_string(p, dtype_str, sizeof(dtype_str));
-                if (strcmp(dtype_str, "fp32") == 0) layer->dtype = TB_DTYPE_F32;
+                if (strcmp(dtype_str, "fp32") == 0)      layer->dtype = TB_DTYPE_F32;
                 else if (strcmp(dtype_str, "fp16") == 0) layer->dtype = TB_DTYPE_F16;
                 else if (strcmp(dtype_str, "bf16") == 0) layer->dtype = TB_DTYPE_BF16;
                 else if (strcmp(dtype_str, "fp64") == 0) layer->dtype = TB_DTYPE_F64;
+                else if (strcmp(dtype_str, "int8") == 0) layer->dtype = TB_DTYPE_INT8;
+                else if (strcmp(dtype_str, "int4") == 0) layer->dtype = TB_DTYPE_INT4;
             } else if (strcmp(key, "num_weights") == 0) {
                 int64_t v;
                 tb_json_parse_int(p, &v);
@@ -402,6 +404,14 @@ static int tb_json_parse_tensors(TbJsonParser* p, TbLayerDesc* layers, int max_l
                 int64_t v;
                 tb_json_parse_int(p, &v);
                 layer->num_mask_bytes = (size_t)v;
+            } else if (strcmp(key, "scale_count") == 0) {
+                int64_t v;
+                tb_json_parse_int(p, &v);
+                layer->scale_count = (size_t)v;
+            } else if (strcmp(key, "group_size") == 0) {
+                int64_t v;
+                tb_json_parse_int(p, &v);
+                layer->group_size = (uint32_t)v;
             } else {
                 tb_json_skip_value(p);
             }
@@ -699,6 +709,31 @@ int tb_model_get_mask_tensor(const TbModel* model, int layer_idx, TbTensor* out)
     /* mask is 1D: one byte per M-sized group */
     size_t shape[1] = {layer->num_mask_bytes};
     *out = tb_tensor_wrap((void*)(base + offset + hdr->masks_offset), shape, 1, TB_DTYPE_U8,
+                           TB_DEVICE_CPU);
+    return TB_OK;
+}
+
+int tb_model_get_scale_tensor(const TbModel* model, int layer_idx, TbTensor* out) {
+    if (layer_idx < 0 || layer_idx >= model->num_layers) return TB_ERR_LAYER_NOT_FOUND;
+    if (!model->mapped_data) return TB_ERR_INVALID_ARG;
+
+    const TbLayerDesc* layer = &model->layers[layer_idx];
+    if (layer->scale_count == 0) return TB_ERR_UNSUPPORTED_DTYPE;
+
+    const uint8_t* base   = (const uint8_t*)model->mapped_data;
+    size_t         offset = layer->tbm_offset;
+
+    const TBHeader* hdr = (const TBHeader*)(base + offset);
+    if (hdr->magic != TB_MAGIC) return TB_ERR_BAD_MAGIC;
+
+    /* scales live after quantized weights (ceil(num_weights/2) for INT4, num_weights for INT8) */
+    size_t weight_byte_size = (layer->dtype == TB_DTYPE_INT4)
+        ? (layer->num_weights + 1) / 2
+        : layer->num_weights;
+    size_t scales_offset = offset + hdr->weights_offset + weight_byte_size;
+
+    size_t scale_shape[1] = {layer->scale_count};
+    *out = tb_tensor_wrap((void*)(base + scales_offset), scale_shape, 1, TB_DTYPE_F32,
                            TB_DEVICE_CPU);
     return TB_OK;
 }

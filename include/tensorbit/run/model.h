@@ -21,6 +21,8 @@ typedef struct {
     size_t   num_weights;
     size_t   num_mask_bytes;
     size_t   tbm_offset;
+    size_t   scale_count;
+    uint32_t group_size;
 } TbLayerDesc;
 
 /* ================================================================
@@ -88,6 +90,9 @@ int tb_model_get_weight_tensor(const TbModel* model, int layer_idx, TbTensor* ou
 
 /* Get tensor for a layer's mask (zero-copy window into mmap'd data) */
 int tb_model_get_mask_tensor(const TbModel* model, int layer_idx, TbTensor* out);
+
+/* Get tensor for a layer's dequantization scales (FP32, zero-copy) */
+int tb_model_get_scale_tensor(const TbModel* model, int layer_idx, TbTensor* out);
 
 /* ================================================================
  * .tbm builder (for tests / conversion scripts)

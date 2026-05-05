@@ -87,13 +87,15 @@ typedef enum {
  * ================================================================ */
 
 typedef enum {
-    TB_DTYPE_F32 = 0,
-    TB_DTYPE_F16 = 1,
+    TB_DTYPE_F32  = 0,
+    TB_DTYPE_F16  = 1,
     TB_DTYPE_BF16 = 2,
-    TB_DTYPE_F64 = 3,
-    TB_DTYPE_I32 = 4,
-    TB_DTYPE_U8 = 5,
-    TB_DTYPE_U32 = 6,
+    TB_DTYPE_F64  = 3,
+    TB_DTYPE_I32  = 4,
+    TB_DTYPE_U8   = 5,
+    TB_DTYPE_U32  = 6,
+    TB_DTYPE_INT8 = 7,
+    TB_DTYPE_INT4 = 8,
 } TbDtype;
 
 TB_INLINE size_t tb_dtype_size(TbDtype dtype) {
@@ -112,6 +114,10 @@ TB_INLINE size_t tb_dtype_size(TbDtype dtype) {
             return 1;
         case TB_DTYPE_U32:
             return 4;
+        case TB_DTYPE_INT8:
+            return 1;
+        case TB_DTYPE_INT4:
+            return 0;  /* variable: ceil(count/2) bytes for N logical elements */
         default:
             return 0;
     }
