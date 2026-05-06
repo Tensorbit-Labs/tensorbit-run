@@ -6,6 +6,7 @@
 ///
 /// Auto-detects model naming conventions (Llama, GPT-J, Phi) by probing
 /// tensor names.  Handles sparse N:M and dense linear paths with GQA support.
+/// INT4/INT8 weights are dequantized on-the-fly per operation.
 
 #include "tensorbit/run/backend.hpp"
 #include "tensorbit/run/common.hpp"
@@ -33,68 +34,51 @@ public:
     explicit TransformerRunner(const Model& model) : model_(model), state_() {}
 
     void init_state() {
-        auto cfg = model_.config();
-        int  hidden = cfg.hidden_size > 0 ? cfg.hidden_size : 512;
-        int  n_layers = cfg.num_layers > 0 ? cfg.num_layers : 1;
+        auto c = normalized_config();
 
-        state_.x = Tensor({(size_t)std::max(hidden, cfg.vocab_size)}, Dtype::kF32);
-        state_.residual = Tensor({(size_t)hidden}, Dtype::kF32);
+        state_.x = Tensor({(size_t)std::max(c.hidden, c.vocab)}, Dtype::kF32);
+        state_.residual = Tensor({(size_t)c.hidden}, Dtype::kF32);
         state_.seq_pos = 0;
 
-        state_.k_cache.resize(n_layers);
-        state_.v_cache.resize(n_layers);
-        for (int i = 0; i < n_layers; i++) {
-            int n_kv = cfg.num_kv_heads > 0 ? cfg.num_kv_heads : cfg.num_heads;
-            size_t hd = (cfg.head_dim > 0) ? (size_t)cfg.head_dim :
-                         (size_t)hidden / (cfg.num_heads > 0 ? cfg.num_heads : 1);
-            size_t kv_dim = (size_t)n_kv * hd;
-            state_.k_cache[i] = Tensor({(size_t)cfg.max_seq_len, kv_dim}, Dtype::kF32);
-            state_.v_cache[i] = Tensor({(size_t)cfg.max_seq_len, kv_dim}, Dtype::kF32);
+        state_.k_cache.resize(c.layers);
+        state_.v_cache.resize(c.layers);
+        size_t kv_dim = (size_t)c.n_kv_heads * c.head_dim;
+        for (int i = 0; i < c.layers; i++) {
+            state_.k_cache[i] = Tensor({(size_t)c.max_seq, kv_dim}, Dtype::kF32);
+            state_.v_cache[i] = Tensor({(size_t)c.max_seq, kv_dim}, Dtype::kF32);
         }
     }
 
-    void reset() {
-        state_.seq_pos = 0;
-    }
+    void reset() { state_.seq_pos = 0; }
 
-    int vocab_size() const { return model_.config().vocab_size; }
+    int vocab_size() const {
+        auto c = normalized_config();
+        return c.vocab;
+    }
     const float* logits() const { return state_.x.f32(); }
 
     /// Flexible layer name search: tries multiple naming conventions.
     static std::string find_weight_name(const Model& m, int layer, const char* component) {
-        // Llama/Mistral: model.layers.{layer}.{component}.weight
         std::string llama = "model.layers." + std::to_string(layer) + "." + component + ".weight";
         if (m.find_layer(llama) >= 0) return llama;
 
-        // GPT-J: transformer.h.{layer}.{component}.weight
         std::string gptj = "transformer.h." + std::to_string(layer) + "." + component + ".weight";
         if (m.find_layer(gptj) >= 0) return gptj;
 
-        // Phi: transformer.h.{layer}.{component}.weight (same as GPT-J)
-        // Phi also uses model.layers.{layer}.{component}.weight for some releases
-        // Try bare component (no layer prefix — some optimised configs):
         std::string bare = component + std::string(".weight");
         if (m.find_layer(bare) >= 0) return bare;
 
-        return "";  // not found
+        return "";
     }
 
-    /// Find a named weight layer in the model, 0..num_layers-1, or -1.
     static int find_weight_idx(const Model& m, const std::string& name) {
         if (name.empty()) return -1;
         return m.find_layer(name);
     }
 
-    /// Single token forward pass.
     const float* forward(int token_id) {
-        auto cfg = model_.config();
-        int  hidden = cfg.hidden_size > 0 ? cfg.hidden_size : 512;
-        int  n_layers = cfg.num_layers > 0 ? cfg.num_layers : 1;
-        int  n_heads = cfg.num_heads > 0 ? cfg.num_heads : 8;
-        int  n_kv_heads = cfg.num_kv_heads > 0 ? cfg.num_kv_heads : n_heads;
-        int  head_dim = cfg.head_dim > 0 ? cfg.head_dim : (hidden / n_heads);
-
-        if (head_dim <= 0 || hidden <= 0) return nullptr;
+        auto c = normalized_config();
+        if (c.head_dim <= 0 || c.hidden <= 0 || c.vocab <= 0) return nullptr;
 
         // Embedding
         int emb_idx = -1;
@@ -108,7 +92,7 @@ public:
         embedding(state_.x, &token_id, 1, emb);
 
         // Layer loop
-        for (int l = 0; l < n_layers; l++) {
+        for (int l = 0; l < c.layers; l++) {
             auto Qw = find_weight_name(model_, l, "self_attn.q_proj");
             auto Kw = find_weight_name(model_, l, "self_attn.k_proj");
             auto Vw = find_weight_name(model_, l, "self_attn.v_proj");
@@ -122,7 +106,7 @@ public:
             int wq_i = find_weight_idx(model_, Qw);
             int wk_i = find_weight_idx(model_, Kw);
             int wv_i = find_weight_idx(model_, Vw);
-            if (wq_i < 0 || wk_i < 0 || wv_i < 0) continue;  // no attention — skip
+            if (wq_i < 0 || wk_i < 0 || wv_i < 0) continue;
 
             int wo_i = find_weight_idx(model_, Ow);
             int wg_i = find_weight_idx(model_, Gw);
@@ -133,15 +117,15 @@ public:
 
             // --- RMSNorm before attention ---
             Tensor rms_w = in_i >= 0 ? weight_fp32(in_i) : Tensor();
-            rms_norm(state_.x, state_.x, rms_w, cfg.norm_eps);
+            rms_norm(state_.x, state_.x, rms_w, c.norm_eps);
 
             // --- QKV projections ---
-            int q_dim = n_heads * head_dim;
-            int kv_dim_total = n_kv_heads * head_dim;
+            int q_dim = c.n_heads * c.head_dim;
+            int kv_dim_total = c.n_kv_heads * c.head_dim;
 
-            Tensor q = Tensor({(size_t)n_heads, (size_t)1, (size_t)head_dim}, Dtype::kF32);
-            Tensor k = Tensor({(size_t)n_kv_heads, (size_t)1, (size_t)head_dim}, Dtype::kF32);
-            Tensor v = Tensor({(size_t)n_kv_heads, (size_t)1, (size_t)head_dim}, Dtype::kF32);
+            Tensor q = Tensor({(size_t)c.n_heads, (size_t)1, (size_t)c.head_dim}, Dtype::kF32);
+            Tensor k = Tensor({(size_t)c.n_kv_heads, (size_t)1, (size_t)c.head_dim}, Dtype::kF32);
+            Tensor v = Tensor({(size_t)c.n_kv_heads, (size_t)1, (size_t)c.head_dim}, Dtype::kF32);
 
             Tensor Wq = weight_fp32(wq_i);
             Tensor Wk = weight_fp32(wk_i);
@@ -162,18 +146,17 @@ public:
                 dense_linear(k_flat, state_.x, Wk, Tensor());
                 dense_linear(v_flat, state_.x, Wv, Tensor());
             }
-            // Reshape to [heads, 1, head_dim]
-            for (int h = 0; h < n_heads; h++)
-                std::memcpy(q.f32() + h * head_dim, q_flat.f32() + h * head_dim, head_dim * sizeof(float));
-            for (int h = 0; h < n_kv_heads; h++) {
-                std::memcpy(k.f32() + h * head_dim, k_flat.f32() + h * head_dim, head_dim * sizeof(float));
-                std::memcpy(v.f32() + h * head_dim, v_flat.f32() + h * head_dim, head_dim * sizeof(float));
+            for (int h = 0; h < c.n_heads; h++)
+                std::memcpy(q.f32() + h * c.head_dim, q_flat.f32() + h * c.head_dim, c.head_dim * sizeof(float));
+            for (int h = 0; h < c.n_kv_heads; h++) {
+                std::memcpy(k.f32() + h * c.head_dim, k_flat.f32() + h * c.head_dim, c.head_dim * sizeof(float));
+                std::memcpy(v.f32() + h * c.head_dim, v_flat.f32() + h * c.head_dim, c.head_dim * sizeof(float));
             }
 
             // --- RoPE ---
-            rope(q, k, state_.seq_pos, cfg.rope_theta, head_dim);
+            rope(q, k, state_.seq_pos, c.rope_theta, c.head_dim);
 
-            // --- KV cache: write at current position ---
+            // --- KV cache ---
             int pos = state_.seq_pos;
             size_t kv_row = kv_dim_total;
             {
@@ -184,42 +167,38 @@ public:
             }
 
             // --- Attention ---
-            int attn_out_size = q_dim;  // prefill: 1 token
-            if (pos > 0) attn_out_size *= (pos + 1);  // decode: cur_seq tokens
+            int attn_out_size = q_dim;
+            if (pos > 0) attn_out_size *= (pos + 1);
             Tensor attn_out = Tensor({(size_t)attn_out_size}, Dtype::kF32);
 
             if (pos == 0) {
-                float scale = 1.f / sqrtf((float)head_dim);
+                float scale = 1.f / sqrtf((float)c.head_dim);
                 scaled_dot_product(attn_out, q, k, v, nullptr, scale, false);
             } else {
                 int cur_seq = pos + 1;
-                float scale = 1.f / sqrtf((float)head_dim);
+                float scale = 1.f / sqrtf((float)c.head_dim);
+                int n_rep = c.n_heads / c.n_kv_heads;
+                Tensor k_exp = Tensor({(size_t)c.n_heads, (size_t)cur_seq, (size_t)c.head_dim}, Dtype::kF32);
+                Tensor v_exp = Tensor({(size_t)c.n_heads, (size_t)cur_seq, (size_t)c.head_dim}, Dtype::kF32);
+                Tensor q_exp = Tensor({(size_t)c.n_heads, (size_t)cur_seq, (size_t)c.head_dim}, Dtype::kF32);
 
-                // GQA: expand from n_kv_heads to n_heads
-                int n_rep = n_heads / n_kv_heads;
-                Tensor k_exp = Tensor({(size_t)n_heads, (size_t)cur_seq, (size_t)head_dim}, Dtype::kF32);
-                Tensor v_exp = Tensor({(size_t)n_heads, (size_t)cur_seq, (size_t)head_dim}, Dtype::kF32);
-                Tensor q_exp = Tensor({(size_t)n_heads, (size_t)cur_seq, (size_t)head_dim}, Dtype::kF32);
-
-                for (int g = 0; g < n_kv_heads; g++) {
+                for (int g = 0; g < c.n_kv_heads; g++) {
                     for (int r = 0; r < n_rep; r++) {
                         int h_dst = g * n_rep + r;
                         for (int s = 0; s < cur_seq; s++) {
-                            // Correct cache indexing: cache[s * kv_row + g * head_dim + d]
-                            std::memcpy(k_exp.f32() + h_dst * cur_seq * head_dim + s * head_dim,
-                                        state_.k_cache[l].f32() + s * kv_row + g * head_dim,
-                                        head_dim * sizeof(float));
-                            std::memcpy(v_exp.f32() + h_dst * cur_seq * head_dim + s * head_dim,
-                                        state_.v_cache[l].f32() + s * kv_row + g * head_dim,
-                                        head_dim * sizeof(float));
+                            std::memcpy(k_exp.f32() + h_dst * cur_seq * c.head_dim + s * c.head_dim,
+                                        state_.k_cache[l].f32() + s * kv_row + g * c.head_dim,
+                                        c.head_dim * sizeof(float));
+                            std::memcpy(v_exp.f32() + h_dst * cur_seq * c.head_dim + s * c.head_dim,
+                                        state_.v_cache[l].f32() + s * kv_row + g * c.head_dim,
+                                        c.head_dim * sizeof(float));
                         }
                     }
                 }
-                // Pad Q: repeat single token across positions
-                for (int h = 0; h < n_heads; h++)
+                for (int h = 0; h < c.n_heads; h++)
                     for (int s = 0; s < cur_seq; s++)
-                        std::memcpy(q_exp.f32() + h * cur_seq * head_dim + s * head_dim,
-                                    q.f32() + h * head_dim, head_dim * sizeof(float));
+                        std::memcpy(q_exp.f32() + h * cur_seq * c.head_dim + s * c.head_dim,
+                                    q.f32() + h * c.head_dim, c.head_dim * sizeof(float));
 
                 scaled_dot_product(attn_out, q_exp, k_exp, v_exp, nullptr, scale, true);
             }
@@ -228,7 +207,7 @@ public:
             if (wo_i >= 0) {
                 Tensor Wo = weight_fp32(wo_i);
                 Tensor Mo = model_.get_mask(wo_i);
-                Tensor attn_proj = Tensor({(size_t)hidden}, Dtype::kF32);
+                Tensor attn_proj = Tensor({(size_t)c.hidden}, Dtype::kF32);
                 if (Wo.data()) {
                     if (Mo.data())
                         sparse_linear(attn_proj, attn_out, Wo, Mo, Tensor());
@@ -240,8 +219,8 @@ public:
 
             // --- RMSNorm before MLP ---
             Tensor rms_w2 = pn_i >= 0 ? weight_fp32(pn_i) : Tensor();
-            Tensor x_mlp = Tensor({(size_t)hidden}, Dtype::kF32);
-            rms_norm(x_mlp, state_.x, rms_w2, cfg.norm_eps);
+            Tensor x_mlp = Tensor({(size_t)c.hidden}, Dtype::kF32);
+            rms_norm(x_mlp, state_.x, rms_w2, c.norm_eps);
 
             // --- MLP: Gate/Up → SiLU → Down ---
             if (wg_i >= 0 && wu_i >= 0 && wd_i >= 0) {
@@ -252,8 +231,8 @@ public:
                 Tensor Mu = model_.get_mask(wu_i);
                 Tensor Md = model_.get_mask(wd_i);
                 if (Wg.data() && Wu.data()) {
-                    Tensor gate = Tensor({(size_t)cfg.intermediate_size}, Dtype::kF32);
-                    Tensor up   = Tensor({(size_t)cfg.intermediate_size}, Dtype::kF32);
+                    Tensor gate = Tensor({(size_t)c.intermediate}, Dtype::kF32);
+                    Tensor up   = Tensor({(size_t)c.intermediate}, Dtype::kF32);
                     if (Mg.data()) {
                         sparse_linear(gate, x_mlp, Wg, Mg, Tensor());
                     } else {
@@ -265,10 +244,10 @@ public:
                         dense_linear(up, x_mlp, Wu, Tensor());
                     }
                     silu(gate, gate);
-                    for (size_t i = 0; i < (size_t)cfg.intermediate_size; i++)
+                    for (size_t i = 0; i < (size_t)c.intermediate; i++)
                         gate.f32()[i] *= up.f32()[i];
                     if (Wd.data()) {
-                        Tensor mlp_out = Tensor({(size_t)hidden}, Dtype::kF32);
+                        Tensor mlp_out = Tensor({(size_t)c.hidden}, Dtype::kF32);
                         if (Md.data()) {
                             sparse_linear(mlp_out, gate, Wd, Md, Tensor());
                         } else {
@@ -287,7 +266,7 @@ public:
             if (fn_i >= 0) break;
         }
         Tensor fn_w = fn_i >= 0 ? weight_fp32(fn_i) : Tensor();
-        rms_norm(state_.x, state_.x, fn_w, cfg.norm_eps);
+        rms_norm(state_.x, state_.x, fn_w, c.norm_eps);
 
         // --- LM head ---
         int lm_i = -1;
@@ -298,9 +277,9 @@ public:
         if (lm_i >= 0) {
             Tensor Wlm = weight_fp32(lm_i);
             if (Wlm.data()) {
-                Tensor logits = Tensor({(size_t)cfg.vocab_size}, Dtype::kF32);
+                Tensor logits = Tensor({(size_t)c.vocab}, Dtype::kF32);
                 dense_linear(logits, state_.x, Wlm, Tensor());
-                std::memcpy(state_.x.f32(), logits.f32(), cfg.vocab_size * sizeof(float));
+                std::memcpy(state_.x.f32(), logits.f32(), c.vocab * sizeof(float));
             }
         }
 
@@ -309,11 +288,44 @@ public:
     }
 
 private:
-    /* Return FP32 weights for a tensor, dequantizing INT4/INT8 on the fly.
-       The temp FP32 buffer lives only for the duration of the current op
-       (RAII frees it when the Tensor goes out of scope). */
+    /// Merged config with Mistral-7B defaults for stripped/missing values.
+    struct Cfg {
+        int hidden = 4096;
+        int layers = 32;
+        int n_heads = 32;
+        int n_kv_heads = 8;
+        int head_dim = 128;
+        int intermediate = 14336;
+        int vocab = 32000;
+        int max_seq = 2048;
+        float norm_eps = 1e-5f;
+        float rope_theta = 10000.0f;
+    };
+
+    Cfg normalized_config() const {
+        auto cfg = model_.config();
+        Cfg c;
+        if (cfg.hidden_size > 0)      c.hidden = cfg.hidden_size;
+        if (cfg.num_heads > 0)        c.n_heads = cfg.num_heads;
+        if (cfg.num_kv_heads > 0)     c.n_kv_heads = cfg.num_kv_heads;
+        if (cfg.head_dim > 0)         c.head_dim = cfg.head_dim;
+        if (cfg.intermediate_size > 0) c.intermediate = cfg.intermediate_size;
+        if (cfg.vocab_size > 0)       c.vocab = cfg.vocab_size;
+        if (cfg.max_seq_len > 0)      c.max_seq = cfg.max_seq_len;
+        if (cfg.num_layers > 0)       c.layers = cfg.num_layers;
+        if (cfg.norm_eps > 0.0f)      c.norm_eps = cfg.norm_eps;
+        if (cfg.rope_theta > 0.0f)    c.rope_theta = cfg.rope_theta;
+        // head_dim from hidden/n_heads as last resort
+        if (c.head_dim == 0 && c.n_heads > 0 && c.hidden > 0)
+            c.head_dim = c.hidden / c.n_heads;
+        // n_kv_heads defaults to n_heads if unset
+        if (c.n_kv_heads == 0) c.n_kv_heads = c.n_heads;
+        return c;
+    }
+
+    /* Return FP32 weights for a tensor, dequantizing INT4/INT8 on the fly. */
     Tensor weight_fp32(int idx) const {
-        Tensor w = weight_fp32(idx);
+        Tensor w = model_.get_weights(idx);
         if (!w.data()) return w;
         Dtype wdt = w.dtype();
         if (wdt != Dtype::kINT4 && wdt != Dtype::kINT8) return w;
@@ -325,7 +337,7 @@ private:
         Tensor f32w({w.shape()[0], w.shape()[1]}, Dtype::kF32);
         float* dst = f32w.f32();
         const float* scl = sc.f32();
-        uint32_t gs = model_.layer_info(idx).group_size;
+        uint32_t gs = (uint32_t)model_.layer_info(idx).group_size;
         if (gs == 0) gs = (uint32_t)n;
         size_t nsc = sc.shape()[0];
 
@@ -349,6 +361,7 @@ private:
         }
         return f32w;
     }
+
     std::string fmt_layer_name(int layer, const char* component) {
         return "model.layers." + std::to_string(layer) + "." + component;
     }

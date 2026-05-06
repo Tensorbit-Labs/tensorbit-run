@@ -35,16 +35,16 @@ enum class ModelError {
 
 struct ModelConfig {
     std::string architecture;
-    int         hidden_size = 0;
-    int         num_heads = 0;
-    int         num_kv_heads = 0;
-    int         intermediate_size = 0;
-    int         vocab_size = 0;
-    int         max_seq_len = 0;
+    int         hidden_size = 4096;
+    int         num_heads = 32;
+    int         num_kv_heads = 8;
+    int         intermediate_size = 14336;
+    int         vocab_size = 32000;
+    int         max_seq_len = 2048;
     int         num_layers = 0;
-    float       norm_eps = 1e-6f;
+    float       norm_eps = 1e-5f;
     float       rope_theta = 10000.0f;
-    int         head_dim = 0;
+    int         head_dim = 128;
 };
 
 /* ================================================================
