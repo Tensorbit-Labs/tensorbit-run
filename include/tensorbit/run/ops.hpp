@@ -321,7 +321,7 @@ private:
         Tensor sc = model_.get_scales(idx);
         if (!sc.data()) return w;
 
-        size_t n = w.shape[0] * w.shape[1];
+        size_t n = w.shape()[0] * w.shape()[1];
         Tensor f32w({w.shape()[0], w.shape()[1]}, Dtype::kF32);
         float* dst = f32w.f32();
         const float* scl = sc.f32();
