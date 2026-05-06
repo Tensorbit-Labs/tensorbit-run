@@ -44,7 +44,10 @@ public:
         state_.k_cache.resize(n_layers);
         state_.v_cache.resize(n_layers);
         for (int i = 0; i < n_layers; i++) {
-            size_t kv_dim = (size_t)cfg.num_kv_heads * cfg.head_dim;
+            int n_kv = cfg.num_kv_heads > 0 ? cfg.num_kv_heads : cfg.num_heads;
+            size_t hd = (cfg.head_dim > 0) ? (size_t)cfg.head_dim :
+                         (size_t)hidden / (cfg.num_heads > 0 ? cfg.num_heads : 1);
+            size_t kv_dim = (size_t)n_kv * hd;
             state_.k_cache[i] = Tensor({(size_t)cfg.max_seq_len, kv_dim}, Dtype::kF32);
             state_.v_cache[i] = Tensor({(size_t)cfg.max_seq_len, kv_dim}, Dtype::kF32);
         }
@@ -100,7 +103,7 @@ public:
             if (emb_idx >= 0) break;
         }
         if (emb_idx < 0) return nullptr;
-        Tensor emb = model_.get_weight_fp32(emb_idx);
+        Tensor emb = weight_fp32(emb_idx);
         if (!emb.data()) return nullptr;
         embedding(state_.x, &token_id, 1, emb);
 
@@ -129,7 +132,7 @@ public:
             int pn_i = find_weight_idx(model_, Pn);
 
             // --- RMSNorm before attention ---
-            Tensor rms_w = in_i >= 0 ? model_.get_weight_fp32(in_i) : Tensor();
+            Tensor rms_w = in_i >= 0 ? weight_fp32(in_i) : Tensor();
             rms_norm(state_.x, state_.x, rms_w, cfg.norm_eps);
 
             // --- QKV projections ---
@@ -140,9 +143,9 @@ public:
             Tensor k = Tensor({(size_t)n_kv_heads, (size_t)1, (size_t)head_dim}, Dtype::kF32);
             Tensor v = Tensor({(size_t)n_kv_heads, (size_t)1, (size_t)head_dim}, Dtype::kF32);
 
-            Tensor Wq = model_.get_weight_fp32(wq_i);
-            Tensor Wk = model_.get_weight_fp32(wk_i);
-            Tensor Wv = model_.get_weight_fp32(wv_i);
+            Tensor Wq = weight_fp32(wq_i);
+            Tensor Wk = weight_fp32(wk_i);
+            Tensor Wv = weight_fp32(wv_i);
             if (!Wq.data() || !Wk.data() || !Wv.data()) continue;
 
             Tensor Mq = model_.get_mask(wq_i);
@@ -223,7 +226,7 @@ public:
 
             // --- Output projection ---
             if (wo_i >= 0) {
-                Tensor Wo = model_.get_weight_fp32(wo_i);
+                Tensor Wo = weight_fp32(wo_i);
                 Tensor Mo = model_.get_mask(wo_i);
                 Tensor attn_proj = Tensor({(size_t)hidden}, Dtype::kF32);
                 if (Wo.data()) {
@@ -236,15 +239,15 @@ public:
             }
 
             // --- RMSNorm before MLP ---
-            Tensor rms_w2 = pn_i >= 0 ? model_.get_weight_fp32(pn_i) : Tensor();
+            Tensor rms_w2 = pn_i >= 0 ? weight_fp32(pn_i) : Tensor();
             Tensor x_mlp = Tensor({(size_t)hidden}, Dtype::kF32);
             rms_norm(x_mlp, state_.x, rms_w2, cfg.norm_eps);
 
             // --- MLP: Gate/Up → SiLU → Down ---
             if (wg_i >= 0 && wu_i >= 0 && wd_i >= 0) {
-                Tensor Wg = model_.get_weight_fp32(wg_i);
-                Tensor Wu = model_.get_weight_fp32(wu_i);
-                Tensor Wd = model_.get_weight_fp32(wd_i);
+                Tensor Wg = weight_fp32(wg_i);
+                Tensor Wu = weight_fp32(wu_i);
+                Tensor Wd = weight_fp32(wd_i);
                 Tensor Mg = model_.get_mask(wg_i);
                 Tensor Mu = model_.get_mask(wu_i);
                 Tensor Md = model_.get_mask(wd_i);
@@ -283,7 +286,7 @@ public:
             fn_i = model_.find_layer(name);
             if (fn_i >= 0) break;
         }
-        Tensor fn_w = fn_i >= 0 ? model_.get_weight_fp32(fn_i) : Tensor();
+        Tensor fn_w = fn_i >= 0 ? weight_fp32(fn_i) : Tensor();
         rms_norm(state_.x, state_.x, fn_w, cfg.norm_eps);
 
         // --- LM head ---
@@ -293,7 +296,7 @@ public:
             if (lm_i >= 0) break;
         }
         if (lm_i >= 0) {
-            Tensor Wlm = model_.get_weight_fp32(lm_i);
+            Tensor Wlm = weight_fp32(lm_i);
             if (Wlm.data()) {
                 Tensor logits = Tensor({(size_t)cfg.vocab_size}, Dtype::kF32);
                 dense_linear(logits, state_.x, Wlm, Tensor());
@@ -306,6 +309,46 @@ public:
     }
 
 private:
+    /* Return FP32 weights for a tensor, dequantizing INT4/INT8 on the fly.
+       The temp FP32 buffer lives only for the duration of the current op
+       (RAII frees it when the Tensor goes out of scope). */
+    Tensor weight_fp32(int idx) const {
+        Tensor w = weight_fp32(idx);
+        if (!w.data()) return w;
+        Dtype wdt = w.dtype();
+        if (wdt != Dtype::kINT4 && wdt != Dtype::kINT8) return w;
+
+        Tensor sc = model_.get_scales(idx);
+        if (!sc.data()) return w;
+
+        size_t n = w.shape[0] * w.shape[1];
+        Tensor f32w({w.shape()[0], w.shape()[1]}, Dtype::kF32);
+        float* dst = f32w.f32();
+        const float* scl = sc.f32();
+        uint32_t gs = model_.layer_info(idx).group_size;
+        if (gs == 0) gs = (uint32_t)n;
+        size_t nsc = sc.shape()[0];
+
+        if (wdt == Dtype::kINT4) {
+            const uint8_t* src = (const uint8_t*)w.data();
+            for (size_t i = 0; i < n; ++i) {
+                size_t g = i / gs;
+                float scale = (g < nsc) ? scl[g] : 1.0f;
+                size_t pi = i / 2;
+                uint8_t b = src[pi];
+                int nib = (i & 1) ? (b >> 4) : (b & 0xF);
+                dst[i] = (nib & 8) ? (float)(nib - 16) * scale : (float)nib * scale;
+            }
+        } else {
+            const int8_t* src = (const int8_t*)w.data();
+            for (size_t i = 0; i < n; ++i) {
+                size_t g = i / gs;
+                float scale = (g < nsc) ? scl[g] : 1.0f;
+                dst[i] = (float)src[i] * scale;
+            }
+        }
+        return f32w;
+    }
     std::string fmt_layer_name(int layer, const char* component) {
         return "model.layers." + std::to_string(layer) + "." + component;
     }

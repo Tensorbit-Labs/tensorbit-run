@@ -336,7 +336,7 @@ static int tb_json_parse_config(TbJsonParser* p, TbModelConfig* cfg) {
     }
 
     if (cfg->num_kv_heads == 0) cfg->num_kv_heads = cfg->num_heads;
-    cfg->head_dim = cfg->hidden_size / cfg->num_heads;
+    cfg->head_dim = (cfg->num_heads > 0) ? (cfg->hidden_size / cfg->num_heads) : 0;
     return p->err ? TB_ERR_JSON_PARSE : TB_OK;
 }
 

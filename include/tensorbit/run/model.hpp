@@ -57,6 +57,8 @@ struct LayerInfo {
     int         nm_n = 0;
     int         nm_m = 0;
     Dtype       dtype = Dtype::kF32;
+    int         scale_count = 0;
+    int         group_size = 0;
 };
 
 /* ================================================================
@@ -142,6 +144,8 @@ public:
             info.nm_n = (int)l.nm_n;
             info.nm_m = (int)l.nm_m;
             info.dtype = static_cast<Dtype>(l.dtype);
+            info.scale_count = (int)l.scale_count;
+            info.group_size  = (int)l.group_size;
         }
         return info;
     }
